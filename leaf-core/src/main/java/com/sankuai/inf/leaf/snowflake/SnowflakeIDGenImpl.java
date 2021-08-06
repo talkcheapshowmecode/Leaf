@@ -60,6 +60,7 @@ public class SnowflakeIDGenImpl implements IDGen {
     @Override
     public synchronized Result get(String key) {
         long timestamp = timeGen();
+        //出现时间回拨
         if (timestamp < lastTimestamp) {
             long offset = lastTimestamp - timestamp;
             if (offset <= 5) {
@@ -77,6 +78,7 @@ public class SnowflakeIDGenImpl implements IDGen {
                 return new Result(-3, Status.EXCEPTION);
             }
         }
+        //同一毫秒内的请求
         if (lastTimestamp == timestamp) {
             sequence = (sequence + 1) & sequenceMask;
             if (sequence == 0) {
@@ -89,6 +91,8 @@ public class SnowflakeIDGenImpl implements IDGen {
             sequence = RANDOM.nextInt(100);
         }
         lastTimestamp = timestamp;
+        //时间戳13位，转二进制后共41位，左移22位，即41+22 = 63位
+        //拼接字符串,时间戳(41位时间戳) + 10位workId + 12位sequence
         long id = ((timestamp - twepoch) << timestampLeftShift) | (workerId << workerIdShift) | sequence;
         return new Result(id, Status.SUCCESS);
 
@@ -105,9 +109,4 @@ public class SnowflakeIDGenImpl implements IDGen {
     protected long timeGen() {
         return System.currentTimeMillis();
     }
-
-    public long getWorkerId() {
-        return workerId;
-    }
-
 }

@@ -37,6 +37,7 @@ public class SegmentIDGenImpl implements IDGen {
      * 一个Segment维持时间为15分钟
      */
     private static final long SEGMENT_DURATION = 15 * 60 * 1000L;
+    //使用的是SynchronousQueue？
     private ExecutorService service = new ThreadPoolExecutor(5, Integer.MAX_VALUE, 60L, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), new UpdateThreadFactory());
     private volatile boolean initOK = false;
     private Map<String, SegmentBuffer> cache = new ConcurrentHashMap<String, SegmentBuffer>();
@@ -159,16 +160,25 @@ public class SegmentIDGenImpl implements IDGen {
         StopWatch sw = new Slf4JStopWatch();
         SegmentBuffer buffer = segment.getBuffer();
         LeafAlloc leafAlloc;
+        //初始化调用
         if (!buffer.isInitOk()) {
             leafAlloc = dao.updateMaxIdAndGetLeafAlloc(key);
             buffer.setStep(leafAlloc.getStep());
             buffer.setMinStep(leafAlloc.getStep());//leafAlloc中的step为DB中的step
-        } else if (buffer.getUpdateTimestamp() == 0) {
+        } else if (buffer.getUpdateTimestamp() == 0) {//初始化后的首次调用，不明白为什么在这时才设置updateTimestamp?
             leafAlloc = dao.updateMaxIdAndGetLeafAlloc(key);
             buffer.setUpdateTimestamp(System.currentTimeMillis());
             buffer.setStep(leafAlloc.getStep());
             buffer.setMinStep(leafAlloc.getStep());//leafAlloc中的step为DB中的step
         } else {
+            //segment段使用过程中调用，会根据调用的频率，改变step的大小，调整查询数据库的频率
+            //前提：执行该方法时说明之前段中的id已用完
+            /**
+             *   调整策略：
+             *   1.两次更新间隔在15分钟之内时，step每次增加一倍，直到达到上限100_0000
+             *   2.两次更新间隔在30分钟之内时，步长不调整
+             *   3.再次更新间隔大于30分钟以上的，step为nextStep / 2 或 nextStep
+             */
             long duration = System.currentTimeMillis() - buffer.getUpdateTimestamp();
             int nextStep = buffer.getStep();
             if (duration < SEGMENT_DURATION) {
@@ -201,13 +211,18 @@ public class SegmentIDGenImpl implements IDGen {
 
     public Result getIdFromSegmentBuffer(final SegmentBuffer buffer) {
         while (true) {
+            //设置读锁
             buffer.rLock().lock();
             try {
+                //获取buffer中当前可用的Segment
                 final Segment segment = buffer.getCurrent();
+                //如果buffer中下一个可用的segment未准备好，且当前buffer中可用id数小于step*0.9（这个值会不会太高了？），在抢到执行buffer线程权时，执行预更新操作
+                //在高并发情况下，如果查询数据库还没有返回，会造成
                 if (!buffer.isNextReady() && (segment.getIdle() < 0.9 * segment.getStep()) && buffer.getThreadRunning().compareAndSet(false, true)) {
                     service.execute(new Runnable() {
                         @Override
                         public void run() {
+                            //获取另一个buffer
                             Segment next = buffer.getSegments()[buffer.nextPos()];
                             boolean updateOk = false;
                             try {
@@ -218,6 +233,7 @@ public class SegmentIDGenImpl implements IDGen {
                                 logger.warn(buffer.getKey() + " updateSegmentFromDb exception", e);
                             } finally {
                                 if (updateOk) {
+                                    //buffer配置成功，开启写锁，更新buffer信息
                                     buffer.wLock().lock();
                                     buffer.setNextReady(true);
                                     buffer.getThreadRunning().set(false);
@@ -237,8 +253,10 @@ public class SegmentIDGenImpl implements IDGen {
                 buffer.rLock().unlock();
             }
             waitAndSleep(buffer);
+            //执行到这里，说明当前buffer中可用value已达max
             buffer.wLock().lock();
             try {
+                //DCL，再做一次检查，当前buffer中的可用segment中的value是否已到max
                 final Segment segment = buffer.getCurrent();
                 long value = segment.getValue().getAndIncrement();
                 if (value < segment.getMax()) {
@@ -259,6 +277,7 @@ public class SegmentIDGenImpl implements IDGen {
 
     private void waitAndSleep(SegmentBuffer buffer) {
         int roll = 0;
+        //抢到锁的为什么还要进行wait？自旋后睡眠10ms
         while (buffer.getThreadRunning().get()) {
             roll += 1;
             if(roll > 10000) {
